@@ -6,9 +6,10 @@ Features
 - Adds a UI dropdown action on the image page: “Tag image (LLM)”.
 - Sends the image to your configured LLM endpoint and logs suggested tags.
 - Minimal settings to configure server URL, model, temperature, max tokens, and timeout.
+- Applies selected tags to the image via GraphQL mutations.
 
 Notes
-- This initial version logs the suggested tags but does not yet persist them to the database. That can be added by calling GraphQL mutations to upsert and attach tags.
+- This version applies suggested tags to the image via GraphQL mutations.
 - The plugin works without external dependencies by using Python’s standard library HTTP client.
 
 Configuration
