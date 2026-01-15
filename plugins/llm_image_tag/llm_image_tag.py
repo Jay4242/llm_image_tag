@@ -20,6 +20,8 @@ import traceback
 import urllib.error
 import urllib.request
 from typing import Any, Optional, List, Dict
+import io
+from PIL import Image
 
 # Stash helper classes
 try:
@@ -216,11 +218,25 @@ def _read_image_bytes(path_or_url: str) -> tuple[bytes, str]:
         if status < 200 or status >= 300:
             raise RuntimeError(f"Failed to fetch image URL {path_or_url}: HTTP {status}")
         content_type = headers.get("Content-Type") or "application/octet-stream"
-        return body, content_type
+        data, mime = body, content_type
+    else:
+        mime = mimetypes.guess_type(os.path.basename(path_or_url))[0] or "image/jpeg"
+        with open(path_or_url, "rb") as f:
+            data = f.read()
 
-    mime = mimetypes.guess_type(os.path.basename(path_or_url))[0] or "image/jpeg"
-    with open(path_or_url, "rb") as f:
-        return f.read(), mime
+    # Convert WebP images to PNG (or JPEG) in memory before base64 encoding
+    if mime == "image/webp":
+        try:
+            img = Image.open(io.BytesIO(data))
+            with io.BytesIO() as out:
+                img.save(out, format="PNG")
+                data = out.getvalue()
+                mime = "image/png"
+        except Exception as e:
+            # Log but continue with original data if conversion fails
+            stash.Warn(f"Failed to convert WebP to PNG: {e}")
+
+    return data, mime
 
 def _message_content_to_str(msg: Any) -> str:
     if isinstance(msg, str):
