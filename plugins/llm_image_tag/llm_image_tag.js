@@ -145,6 +145,59 @@
     return tags.map((t) => t.id);
   }
 
+  function basenameFromPath(rawPath) {
+    if (!rawPath || typeof rawPath !== 'string') return null;
+    let path = rawPath;
+    if (rawPath.includes('://')) {
+      try {
+        path = new URL(rawPath).pathname || rawPath;
+      } catch (e) {
+        path = rawPath;
+      }
+    }
+    const trimmed = path.split('?')[0].split('#')[0];
+    const parts = trimmed.split(/[\\/]/);
+    return parts[parts.length - 1] || null;
+  }
+
+  async function findImageFilename(graphqlURL, imageId) {
+    const query = `
+      query FindImage($id: ID!) {
+        findImage(id: $id) {
+          paths { image }
+          files { path basename }
+          visual_files {
+            ... on ImageFile { path basename }
+            ... on VideoFile { path basename }
+          }
+        }
+      }
+    `;
+    try {
+      const data = await graphqlRequest(graphqlURL, query, { id: imageId });
+      const image = data?.findImage || null;
+      let path = null;
+      let basename = null;
+      if (Array.isArray(image?.files) && image.files.length) {
+        basename = image.files[0]?.basename || null;
+        path = image.files[0]?.path || null;
+      }
+      if (!basename && Array.isArray(image?.visual_files) && image.visual_files.length) {
+        basename = image.visual_files[0]?.basename || null;
+      }
+      if (!path && Array.isArray(image?.visual_files) && image.visual_files.length) {
+        path = image.visual_files[0]?.path || null;
+      }
+      if (!path) {
+        path = image?.paths?.image || null;
+      }
+      return basename || basenameFromPath(path);
+    } catch (e) {
+      console.warn('[LLMImageTag] Failed to resolve image filename:', e);
+      return null;
+    }
+  }
+
   async function findTagMatch(graphqlURL, name) {
     const query = `
       query FindTags($filter: FindFilterType) {
@@ -216,8 +269,8 @@
 
   async function runTag(imageId) {
     const mutation = `
-      mutation RunPluginTask($plugin_id: ID!, $args_map: Map!) {
-        runPluginTask(plugin_id: $plugin_id, args_map: $args_map)
+      mutation RunPluginTask($plugin_id: ID!, $args_map: Map!, $description: String) {
+        runPluginTask(plugin_id: $plugin_id, args_map: $args_map, description: $description)
       }
     `;
     const requestId = `req_${Date.now()}_${Math.random()
@@ -229,6 +282,10 @@
       request_id: requestId,
     };
     const graphqlURL = getGraphqlURL();
+    const filename = await findImageFilename(graphqlURL, imageId);
+    const suffix = filename || `image ${imageId}`;
+    const description = `llm_image_tag: ${suffix}`;
+    console.debug('[LLMImageTag] Task description:', description);
 
     const resolvedId = await resolvePluginId(graphqlURL);
     if (!resolvedId) {
@@ -242,7 +299,10 @@
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: mutation, variables: { plugin_id: resolvedId, args_map } }),
+        body: JSON.stringify({
+          query: mutation,
+          variables: { plugin_id: resolvedId, args_map, description },
+        }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
       const json = await res.json();
