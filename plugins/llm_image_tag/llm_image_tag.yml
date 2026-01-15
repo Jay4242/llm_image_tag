@@ -1,0 +1,38 @@
+name: LLMImageTag
+description: Tags images using a vision LLM and attaches suggested tags.
+version: 0.1.0
+url: https://github.com/Jay4242/llm_image_tag/
+ui:
+  javascript:
+    - llm_image_tag.js
+  assets:
+    /results: results
+settings:
+  llmBaseUrl:
+    displayName: LLM Base URL
+    description: "HTTP base URL for the OpenAI-compatible endpoint (e.g. http://localhost:11434/v1)."
+    type: STRING
+  llmModel:
+    displayName: LLM Model
+    description: "Model name to use for tagging."
+    type: STRING
+  llmTemp:
+    displayName: Temperature
+    description: "Sampling temperature."
+    type: NUMBER
+  llmMaxTokens:
+    displayName: Max tokens
+    description: "Maximum tokens to request (-1 for backend default)."
+    type: NUMBER
+  llmTimeout:
+    displayName: LLM Timeout (seconds)
+    description: "Timeout for contacting the LLM server."
+    type: NUMBER
+  zzdebugTracing:
+    displayName: Debug Tracing
+    description: Enable additional debug logs.
+    type: BOOLEAN
+exec:
+  - python
+  - "{pluginDir}/llm_image_tag.py"
+interface: raw
