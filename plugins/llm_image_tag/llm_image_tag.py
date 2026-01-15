@@ -303,8 +303,7 @@ def _parse_tags(text: str) -> List[str]:
     cleaned: List[str] = []
     for t in tags:
         t = t.strip().strip("#").strip().lower()
-        t = t.replace("_", "-").replace(" ", "-")
-        t = "".join(ch for ch in t if (ch.isalnum() or ch == "-"))
+        t = "".join(ch for ch in t if (ch.isalnum() or ch in "- _"))
         if 1 <= len(t) <= 50:
             cleaned.append(t)
     seen = set()
