@@ -15,6 +15,9 @@ Features
 Notes
 - This version applies suggested tags to the image via GraphQL mutations from the JS frontend.
 - The Python backend requires **Pillow** for WebP-to-PNG conversion (`pip install Pillow`).
+- The plugin writes intermediate results to a `results/` directory (served as plugin assets for the UI).
+  - Streaming progress files are deleted immediately once the final result is written.
+  - Completed result files are automatically cleaned up on the next plugin run if older than 1 hour.
 
 Configuration (Settings)
 - llmBaseUrl (env: LLM_BASE_URL; default http://localhost:11434/v1)
