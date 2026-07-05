@@ -28,6 +28,10 @@ settings:
     displayName: LLM Timeout (seconds)
     description: "Timeout for contacting the LLM server."
     type: NUMBER
+  includeTagDescriptions:
+    displayName: Include Tag Descriptions
+    description: Include tag descriptions alongside tag names in the LLM prompt to help the model choose more accurate tags.
+    type: BOOLEAN
   zzdebugTracing:
     displayName: Debug Tracing
     description: Enable additional debug logs.
