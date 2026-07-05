@@ -41,8 +41,8 @@ DEFAULT_TIMEOUT = 3600.0
 
 PROMPT_DEFAULT = (
     "You are a tagging assistant. Look carefully at the image and return ONLY a JSON array "
-    "of 1-4 short, general-purpose tags that DIRECTLY describe what is clearly visible in the image. "
-    "Choose the few most salient tags; fewer is fine when appropriate (as low as 1). "
+    "of short, general-purpose tags that DIRECTLY describe what is clearly visible in the image. "
+    "Include as many tags as are applicable; there is no strict upper limit. "
     "Use lowercase ASCII letters/digits; multiword tags may contain spaces. "
     "Do NOT use dashes; use spaces between words. "
     "Do NOT guess or infer hidden attributes. Include a tag only if it is clearly visible in the image. "
@@ -180,6 +180,9 @@ MAX_TOKENS: int = int(_env_or_setting("llmMaxTokens", "LLM_MAX_TOKENS", DEFAULT_
 TIMEOUT: float = float(_env_or_setting("llmTimeout", "LLM_TIMEOUT", DEFAULT_TIMEOUT))
 API_KEY: str = os.getenv("LLM_API_KEY", "none")
 PROMPT: str = os.getenv("LLM_TAG_PROMPT", PROMPT_DEFAULT)
+INCLUDE_TAG_DESCRIPTIONS: bool = _env_or_setting("includeTagDescriptions", "LLM_INCLUDE_TAG_DESCRIPTIONS", True)
+if isinstance(INCLUDE_TAG_DESCRIPTIONS, str):
+    INCLUDE_TAG_DESCRIPTIONS = INCLUDE_TAG_DESCRIPTIONS.strip().lower() in ("true", "1", "yes", "on")
 
 def _http_get(url: str, timeout: float = TIMEOUT) -> tuple[int, Dict[str, str], bytes]:
     req = urllib.request.Request(url, method="GET")
@@ -234,7 +237,7 @@ def _read_image_bytes(path_or_url: str) -> tuple[bytes, str]:
                 mime = "image/png"
         except Exception as e:
             # Log but continue with original data if conversion fails
-            stash.Warn(f"Failed to convert WebP to PNG: {e}")
+            stash.Error(f"Failed to convert WebP to PNG: {e}")
 
     return data, mime
 
@@ -260,29 +263,29 @@ def _message_content_to_str(msg: Any) -> str:
     except Exception:
         return str(msg)
 
-def _call_llm_b64_image(b64: str, mime: str, existing_tags: Optional[list[str]] = None) -> str:
+def _call_llm_b64_image_nonstreaming(b64: str, mime: str, existing_tags: Optional[list[dict[str, str]]] = None) -> str:
     url = f"{BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
     messages: list[dict[str, Any]] = [{"role": "system", "content": PROMPT}]
     if existing_tags:
-        intro = "The following input is a JSON array of available tags. Choose from this list only if they clearly apply to THIS image. Do not guess or infer."
+        intro, payload = _format_tags_for_prompt(existing_tags, INCLUDE_TAG_DESCRIPTIONS)
         messages.append({"role": "user", "content": [{"type": "text", "text": intro}]})
-        messages.append({"role": "user", "content": [{"type": "text", "text": json.dumps(existing_tags, ensure_ascii=False)}]})
+        messages.append({"role": "user", "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]})
     messages.append({"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}]})
 
     # Log text-only parts
     try:
-        if stash.Setting("zzdebugTracing", False):
-            log_lines: list[str] = []
-            for m in messages:
-                content = m.get("content")
-                if isinstance(content, str):
-                    log_lines.append(f"{m.get('role')}: {content}")
-                elif isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            log_lines.append(f"{m.get('role')}: {part.get('text','')}")
-            stash.Log("[LLMImageTag] Prompt (text only):\n" + "\n".join(log_lines))
+        log_lines: list[str] = []
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, str):
+                log_lines.append(f"{m.get('role')}: {content}")
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        log_lines.append(f"{m.get('role')}: {part.get('text','')}")
+        if log_lines:
+            stash.Error("[LLMImageTag] Prompt (text only):\n" + "\n".join(log_lines))
     except Exception:
         pass
 
@@ -296,6 +299,152 @@ def _call_llm_b64_image(b64: str, mime: str, existing_tags: Optional[list[str]] 
         return content
     except Exception:
         raise RuntimeError(f"Unexpected LLM response: {data!r}")
+
+
+def _write_stream_progress(image_id, request_id, reasoning, output, done, error=None):
+    if not image_id or not request_id:
+        return
+    results_dir = os.path.join(_plugin_dir(), "results")
+    os.makedirs(results_dir, exist_ok=True)
+    safe_request_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(request_id).strip())
+    payload = {
+        "image_id": int(image_id),
+        "done": bool(done),
+        "reasoning": str(reasoning) if reasoning else "",
+        "output": str(output) if output else "",
+        "error": str(error) if error else None,
+    }
+    tmp_path = os.path.join(results_dir, f"{image_id}_{safe_request_id}_stream.json.tmp")
+    final_path = os.path.join(results_dir, f"{image_id}_{safe_request_id}_stream.json")
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    os.replace(tmp_path, final_path)
+
+
+def _call_llm_b64_image_streaming(b64, mime, existing_tags, request_id, image_id):
+    url = f"{BASE_URL}/chat/completions"
+    h = {"Content-Type": "application/json"}
+    if API_KEY and API_KEY != "none":
+        h["Authorization"] = f"Bearer {API_KEY}"
+
+    messages: list[dict[str, Any]] = [{"role": "system", "content": PROMPT}]
+    if existing_tags:
+        intro, payload = _format_tags_for_prompt(existing_tags, INCLUDE_TAG_DESCRIPTIONS)
+        messages.append({"role": "user", "content": [{"type": "text", "text": intro}]})
+        messages.append({"role": "user", "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]})
+    messages.append({"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}]})
+
+    payload = {"model": MODEL, "messages": messages, "temperature": TEMP, "max_tokens": MAX_TOKENS, "stream": True}
+
+    try:
+        log_lines: list[str] = []
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, str):
+                log_lines.append(f"{m.get('role')}: {content}")
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        log_lines.append(f"{m.get('role')}: {part.get('text','')}")
+        if log_lines:
+            stash.Error("[LLMImageTag] Prompt (text only):\n" + "\n".join(log_lines))
+    except Exception:
+        pass
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=h, method="POST")
+
+    reasoning_parts: list[str] = []
+    output_parts: list[str] = []
+    partial_line = ""
+
+    _write_stream_progress(image_id, request_id, "", "", done=False)
+
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            while True:
+                byte = resp.read(1)
+                if not byte:
+                    break
+                partial_line += byte.decode("utf-8", errors="replace")
+
+                if not partial_line.endswith("\n"):
+                    continue
+
+                line = partial_line.strip()
+                partial_line = ""
+                if not line:
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[len("data: "):]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                choices = event.get("choices")
+                if not choices or not isinstance(choices, list):
+                    continue
+                delta = (choices[0] or {}).get("delta", {})
+                if not isinstance(delta, dict):
+                    continue
+
+                rc = delta.get("reasoning_content")
+                c = delta.get("content")
+
+                if isinstance(rc, str) and rc:
+                    reasoning_parts.append(rc)
+                if isinstance(c, str) and c:
+                    output_parts.append(c)
+
+                _write_stream_progress(
+                    image_id, request_id,
+                    "".join(reasoning_parts),
+                    "".join(output_parts),
+                    done=False,
+                )
+    except Exception as e:
+        _write_stream_progress(
+            image_id, request_id,
+            "".join(reasoning_parts),
+            "".join(output_parts),
+            done=True, error=str(e),
+        )
+        raise
+
+    reasoning_text = "".join(reasoning_parts)
+    output_text = "".join(output_parts)
+
+    if not output_text and not reasoning_text:
+        raise RuntimeError("No content received from LLM stream")
+
+    _write_stream_progress(image_id, request_id, reasoning_text, output_text, done=True)
+
+    return reasoning_text, output_text
+
+
+def _call_llm_b64_image(b64: str, mime: str, existing_tags: Optional[list[dict[str, str]]] = None, request_id: Optional[str] = None, image_id: Optional[int] = None) -> tuple[str, str]:
+    if request_id and image_id:
+        try:
+            reasoning, content = _call_llm_b64_image_streaming(b64, mime, existing_tags, request_id, image_id)
+            return reasoning, content
+        except Exception as e:
+            stash.Error(f"[LLMImageTag] Streaming failed ({e}), falling back to non-streaming")
+
+    content = _call_llm_b64_image_nonstreaming(b64, mime, existing_tags)
+    reasoning = _extract_reasoning_from_content(content)
+    return reasoning, content
+
+
+def _extract_reasoning_from_content(content: str) -> str:
+    think_match = re.search(r"<think>(.*?)</think>", content, flags=re.DOTALL | re.IGNORECASE)
+    if think_match:
+        return think_match.group(1).strip()
+    return ""
+
+
 
 def _strip_think_blocks(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
@@ -330,39 +479,59 @@ def _parse_tags(text: str) -> List[str]:
             uniq.append(t)
     return uniq
 
-def _existing_tags() -> list[str]:
+def _existing_tags() -> list[dict[str, str]]:
     try:
         query = """
             query($filter: FindFilterType) {
               findTags(filter: $filter) {
-                tags { name aliases ignore_auto_tag }
+                tags { name aliases description ignore_auto_tag }
               }
             }
         """
         variables = {"filter": {"per_page": -1}}
         resp = stash._graphql(query, variables)  # type: ignore[attr-defined]
-        names: list[str] = []
+        entries: list[dict[str, str]] = []
         if isinstance(resp, dict):
             tags = (((resp.get("data") or {}).get("findTags") or {}).get("tags")) or []
             for t in tags or []:
                 if t.get("ignore_auto_tag"):
                     continue
                 name = t.get("name")
+                description = t.get("description") or ""
                 if name:
-                    names.append(str(name))
+                    entries.append({"name": str(name), "description": str(description)})
                 for alias in t.get("aliases") or []:
-                    names.append(str(alias))
-        # de-dupe
+                    entries.append({"name": str(alias), "description": str(description)})
+        # de-dupe by name
         seen = set()
-        uniq: list[str] = []
-        for n in names:
-            if n not in seen:
-                seen.add(n)
-                uniq.append(n)
+        uniq: list[dict[str, str]] = []
+        for entry in entries:
+            name = entry["name"]
+            if name not in seen:
+                seen.add(name)
+                uniq.append(entry)
         return uniq
     except Exception as e:
-        stash.Trace(f"[LLMImageTag] Failed to fetch existing tags: {e}")
+        stash.Error(f"[LLMImageTag] Failed to fetch existing tags: {e}")
         return []
+
+def _format_tags_for_prompt(tags: list[dict[str, str]], include_descriptions: bool) -> tuple[str, str]:
+    if include_descriptions:
+        intro = (
+            "The following input is a JSON array of existing tags already in the database, each with a name "
+            "and description. Use the descriptions to understand what each tag means. Choose from these tags "
+            "where applicable, but you may suggest additional tags that are not in this list. "
+            "Do not guess or infer hidden attributes."
+        )
+        payload = tags
+    else:
+        intro = (
+            "The following input is a JSON array of existing tags already in the database. "
+            "Choose from these where applicable, but you may suggest additional tags that are not in this list. "
+            "Do not guess or infer hidden attributes."
+        )
+        payload = [entry["name"] for entry in tags]
+    return intro, payload
 
 def _fetch_image_path(image_id: int) -> Optional[str]:
     try:
@@ -389,7 +558,7 @@ def _fetch_image_path(image_id: int) -> Optional[str]:
         stash.Error(f"[LLMImageTag] GraphQL path lookup failed for image {image_id}: {e}")
         return None
 
-def tags_from_image(path_or_url: str) -> List[str]:
+def tags_from_image(path_or_url: str, request_id: Optional[str] = None, image_id: Optional[int] = None) -> tuple[List[str], str, str]:
     try:
         existing = _existing_tags()
     except Exception:
@@ -397,28 +566,28 @@ def tags_from_image(path_or_url: str) -> List[str]:
     try:
         data, mime = _read_image_bytes(path_or_url)
         b64 = base64.b64encode(data).decode("utf-8")
-        content = _call_llm_b64_image(b64, mime, existing_tags=existing)
-        stash.Trace(f"[LLMImageTag] LLM raw output: {content}")
+        reasoning, content = _call_llm_b64_image(b64, mime, existing_tags=existing, request_id=request_id, image_id=image_id)
+        stash.Error(f"[LLMImageTag] LLM raw output: {content}")
         cleaned = _strip_think_blocks(content)
         tags = _parse_tags(cleaned)
-        return tags
+        return tags, reasoning, content
     except Exception as e:
         tb = traceback.format_exc()
         stash.Error(f"[LLMImageTag] Tagging failed for {path_or_url}: {e}\n{tb}")
-        return []
+        return [], "", ""
 
-def tag_image(image_id: int) -> Optional[List[str]]:
+def tag_image(image_id: int, request_id: Optional[str] = None) -> tuple[Optional[List[str]], str, str]:
     path = _fetch_image_path(image_id)
     if not path:
         stash.Error(f"[LLMImageTag] No image path found for id={image_id}")
-        return None
-    tags = tags_from_image(path)
+        return None, "", ""
+    tags, reasoning, output = tags_from_image(path, request_id=request_id, image_id=image_id)
     if not tags:
-        stash.Warn(f"[LLMImageTag] No tags returned for image {image_id}")
+        stash.Error(f"[LLMImageTag] No tags returned for image {image_id}")
     else:
-        stash.Log(f"[LLMImageTag] Suggested tags for image {image_id}: {tags}")
+        stash.Error(f"[LLMImageTag] Suggested tags for image {image_id}: {tags}")
 
-    return tags
+    return tags, reasoning, output
 
 def tag_image_task() -> None:
     try:
@@ -428,12 +597,12 @@ def tag_image_task() -> None:
             stash.Error("[LLMImageTag] No image_id supplied to tag_image_task")
             return
         image_id = int(image_id)
-        tags = tag_image(image_id)
+        tags, reasoning, output = tag_image(image_id, request_id=request_id)
         error = None
         if tags is None:
             error = "No image path found."
             tags = []
-        _write_result(image_id, tags, error=error, request_id=request_id)
+        _write_result(image_id, tags, error=error, request_id=request_id, reasoning=reasoning, output=output)
     except Exception as e:
         tb = traceback.format_exc()
         stash.Error(f"[LLMImageTag] Exception in tag_image_task: {e}\nTraceBack={tb}")
@@ -441,7 +610,7 @@ def tag_image_task() -> None:
             image_id = stash.JSON_INPUT.get("args", {}).get("image_id") if stash.JSON_INPUT else None
             if image_id is not None:
                 request_id = stash.JSON_INPUT.get("args", {}).get("request_id") if stash.JSON_INPUT else None
-                _write_result(int(image_id), [], error=str(e), request_id=request_id)
+                _write_result(int(image_id), [], error=str(e), request_id=request_id, reasoning="", output="")
         except Exception:
             pass
 
@@ -454,7 +623,7 @@ def _plugin_dir() -> str:
                 return val
     return os.path.dirname(os.path.abspath(__file__))
 
-def _write_result(image_id: int, tags: List[str], error: Optional[str] = None, request_id: Optional[str] = None) -> None:
+def _write_result(image_id: int, tags: List[str], error: Optional[str] = None, request_id: Optional[str] = None, reasoning: str = "", output: str = "") -> None:
     results_dir = os.path.join(_plugin_dir(), "results")
     os.makedirs(results_dir, exist_ok=True)
     safe_request_id = None
@@ -465,6 +634,8 @@ def _write_result(image_id: int, tags: List[str], error: Optional[str] = None, r
         "tags": tags,
         "error": error,
         "request_id": safe_request_id,
+        "reasoning": reasoning,
+        "output": output,
     }
     suffix = f"_{safe_request_id}" if safe_request_id else ""
     tmp_path = os.path.join(results_dir, f"{image_id}{suffix}.json.tmp")
@@ -478,15 +649,15 @@ def _write_result(image_id: int, tags: List[str], error: Optional[str] = None, r
 # -------------
 try:
     if stash.Setting("zzdebugTracing", False):
-        stash.Log(f"[LLMImageTag] Using BASE_URL={BASE_URL!r} model={MODEL!r} temp={TEMP} max_tokens={MAX_TOKENS} timeout={TIMEOUT}")
+        stash.Error(f"[LLMImageTag] Using BASE_URL={BASE_URL!r} model={MODEL!r} temp={TEMP} max_tokens={MAX_TOKENS} timeout={TIMEOUT}")
     if stash.PLUGIN_TASK_NAME == "tag_image_task":
-        stash.Trace(f"PLUGIN_TASK_NAME={stash.PLUGIN_TASK_NAME}")
+        stash.Error(f"PLUGIN_TASK_NAME={stash.PLUGIN_TASK_NAME}")
         tag_image_task()
     elif stash.JSON_INPUT and (stash.JSON_INPUT.get("args", {}).get("mode") == "tag_image_task"):
-        stash.Trace("Dispatch via args.mode=tag_image_task")
+        stash.Error("Dispatch via args.mode=tag_image_task")
         tag_image_task()
     else:
-        stash.Trace(f"[LLMImageTag] No task specified (PLUGIN_TASK_NAME={stash.PLUGIN_TASK_NAME}). Nothing to do.")
+        stash.Error(f"[LLMImageTag] No task specified (PLUGIN_TASK_NAME={stash.PLUGIN_TASK_NAME}). Nothing to do.")
 except Exception as e:
     tb = traceback.format_exc()
     stash.Error(f"[LLMImageTag] Exception while running plugin: {e}\nTraceBack={tb}")
