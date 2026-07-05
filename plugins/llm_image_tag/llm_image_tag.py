@@ -15,6 +15,7 @@ import json
 import mimetypes
 import os
 import re
+import time
 import sys
 import traceback
 import urllib.error
@@ -643,11 +644,39 @@ def _write_result(image_id: int, tags: List[str], error: Optional[str] = None, r
     with open(tmp_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle)
     os.replace(tmp_path, final_path)
+    if safe_request_id:
+        stream_path = os.path.join(results_dir, f"{image_id}_{safe_request_id}_stream.json")
+        try:
+            os.remove(stream_path)
+        except OSError:
+            pass
+
+
+def _cleanup_old_results(max_age_seconds: int = 3600) -> None:
+    results_dir = os.path.join(_plugin_dir(), "results")
+    if not os.path.isdir(results_dir):
+        return
+    now = time.time()
+    count = 0
+    for fname in os.listdir(results_dir):
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(results_dir, fname)
+        try:
+            if now - os.path.getmtime(fpath) > max_age_seconds:
+                os.remove(fpath)
+                count += 1
+        except OSError:
+            pass
+    if count:
+        stash.Log(f"[LLMImageTag] Cleaned up {count} old result file(s)")
+
 
 # -------------
 # Entry point
 # -------------
 try:
+    _cleanup_old_results()
     if stash.Setting("zzdebugTracing", False):
         stash.Error(f"[LLMImageTag] Using BASE_URL={BASE_URL!r} model={MODEL!r} temp={TEMP} max_tokens={MAX_TOKENS} timeout={TIMEOUT}")
     if stash.PLUGIN_TASK_NAME == "tag_image_task":
