@@ -12,7 +12,7 @@
       const hashMatch = window.location.hash.match(/\/images\/(\d+)/);
       if (hashMatch) return parseInt(hashMatch[1], 10);
     } catch (e) {
-      console.warn('[LLMImageTag] Failed to parse image id from URL:', e);
+      console.error('[LLMImageTag] Failed to parse image id from URL:', e);
     }
     return undefined;
   }
@@ -29,6 +29,13 @@
   function getPluginAssetURL(pluginId, assetPath) {
     return new URL(
       `plugin/${pluginId}/assets/${assetPath}`,
+      getBaseURL()
+    ).toString();
+  }
+
+  function getStreamAssetURL(pluginId, imageId, requestId) {
+    return new URL(
+      `plugin/${pluginId}/assets/results/${imageId}_${requestId}_stream.json`,
       getBaseURL()
     ).toString();
   }
@@ -132,6 +139,34 @@
     throw new Error('LLM task cancelled.');
   }
 
+  async function pollStreamResults(pluginId, imageId, requestId, isCancelled, onProgress) {
+    const url = getStreamAssetURL(pluginId, imageId, requestId);
+    let lastReasoning = '';
+    let lastOutput = '';
+    const intervalMs = 10;
+
+    while (!isCancelled()) {
+      try {
+        const res = await fetch(url, {
+          credentials: 'include',
+          cache: 'no-store',
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.reasoning !== lastReasoning || data.output !== lastOutput) {
+            lastReasoning = data.reasoning || '';
+            lastOutput = data.output || '';
+            onProgress(lastReasoning, lastOutput);
+          }
+          if (data.done) break;
+        }
+      } catch (e) {
+        // file not yet available
+      }
+      await sleep(intervalMs);
+    }
+  }
+
   async function findImageTagIds(graphqlURL, imageId) {
     const query = `
       query FindImage($id: ID!) {
@@ -193,7 +228,7 @@
       }
       return basename || basenameFromPath(path);
     } catch (e) {
-      console.warn('[LLMImageTag] Failed to resolve image filename:', e);
+      console.error('[LLMImageTag] Failed to resolve image filename:', e);
       return null;
     }
   }
@@ -257,7 +292,7 @@
         imageUpdate(input: $input) { id }
       }
     `;
-    console.debug('[LLMImageTag] Updating image tags:', {
+    console.error('[LLMImageTag] Updating image tags:', {
       imageId,
       tagCount: tagIds.length,
       tagIds,
@@ -285,7 +320,7 @@
     const filename = await findImageFilename(graphqlURL, imageId);
     const suffix = filename || `image ${imageId}`;
     const description = `llm_image_tag: ${suffix}`;
-    console.debug('[LLMImageTag] Task description:', description);
+    console.error('[LLMImageTag] Task description:', description);
 
     const resolvedId = await resolvePluginId(graphqlURL);
     if (!resolvedId) {
@@ -312,7 +347,7 @@
         return null;
       }
       const jobId = json.data?.runPluginTask || null;
-      console.debug('[LLMImageTag] Tagging queued as job:', jobId);
+      console.error('[LLMImageTag] Tagging queued as job:', jobId);
       return { jobId, pluginId: resolvedId, requestId };
     } catch (e) {
       console.error('[LLMImageTag] Request failed:', e);
@@ -342,10 +377,62 @@
     }
 
     const container = document.createElement('div');
+    container.className = 'llm-tag-modal-container';
     document.body.appendChild(container);
 
+    if (!document.getElementById('llm-tag-modal-styles')) {
+      const styleEl = document.createElement('style');
+      styleEl.id = 'llm-tag-modal-styles';
+      styleEl.textContent =
+        '.llm-tag-modal-wrapper { pointer-events: none !important; }' +
+        '.llm-tag-modal-dialog { pointer-events: auto; }' +
+        '@media (min-width: 1200px) {' +
+        '  .llm-tag-modal-dialog {' +
+        '    position: fixed !important;' +
+        '    left: 0 !important;' +
+        '    top: 0 !important;' +
+        '    margin: 0 !important;' +
+        '    transform: none !important;' +
+        '    width: 450px !important;' +
+        '    max-width: 450px !important;' +
+        '    height: calc(100vh - 4rem) !important;' +
+        '    display: flex !important;' +
+        '    flex-direction: column !important;' +
+        '  }' +
+        '  .llm-tag-modal-dialog .modal-content {' +
+        '    height: 100%;' +
+        '    display: flex;' +
+        '    flex-direction: column;' +
+        '    border-radius: 0;' +
+        '  }' +
+        '  .llm-tag-modal-dialog .modal-body {' +
+        '    overflow-y: auto;' +
+        '    flex: 1;' +
+        '  }' +
+        '}' +
+        '@media (max-width: 1199px) {' +
+        '  .llm-tag-modal-dialog {' +
+        '    position: fixed !important;' +
+        '    bottom: 0 !important;' +
+        '    left: 0 !important;' +
+        '    right: 0 !important;' +
+        '    margin: 0 !important;' +
+        '    transform: none !important;' +
+        '    max-height: 50vh !important;' +
+        '  }' +
+        '  .llm-tag-modal-dialog .modal-content {' +
+        '    border-radius: 0.5rem 0.5rem 0 0;' +
+        '  }' +
+        '  .llm-tag-modal-dialog .modal-body {' +
+        '    overflow-y: auto;' +
+        '    max-height: calc(50vh - 120px);' +
+        '  }' +
+        '}';
+      document.head.appendChild(styleEl);
+    }
+
     function TagModal() {
-      const { useEffect, useMemo, useState } = React;
+      const { useCallback, useEffect, useMemo, useRef, useState } = React;
       let Toast = null;
       try {
         Toast = PluginApi.hooks?.useToast ? PluginApi.hooks.useToast() : null;
@@ -357,6 +444,18 @@
       const [error, setError] = useState('');
       const [suggestions, setSuggestions] = useState([]);
       const [selected, setSelected] = useState([]);
+      const [reasoning, setReasoning] = useState('');
+      const [output, setOutput] = useState('');
+      const [showReasoning, setShowReasoning] = useState(false);
+      const streamBoxRef = useRef(null);
+      const autoScrollRef = useRef(true);
+      const jobIdRef = useRef(null);
+
+      const handleStreamScroll = useCallback(() => {
+        const el = streamBoxRef.current;
+        if (!el) return;
+        autoScrollRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
+      }, []);
 
       const graphqlURL = useMemo(() => getGraphqlURL(), []);
 
@@ -367,15 +466,41 @@
           setError('');
           try {
             const job = await runTag(imageId);
+            if (job?.jobId) jobIdRef.current = job.jobId;
             if (!job?.pluginId || !job?.requestId) {
               throw new Error('Failed to queue LLM tagging task.');
             }
             if (job.jobId) {
+              const streamPoll = pollStreamResults(
+                job.pluginId,
+                imageId,
+                job.requestId,
+                () => cancelled,
+                (r, o) => {
+                  if (!cancelled) {
+                    setReasoning(r);
+                    setOutput(o);
+                  }
+                }
+              );
               await waitForJobComplete(
                 graphqlURL,
                 job.jobId,
                 () => cancelled
               );
+            } else {
+              pollStreamResults(
+                job.pluginId,
+                imageId,
+                job.requestId,
+                () => cancelled,
+                (r, o) => {
+                  if (!cancelled) {
+                    setReasoning(r);
+                    setOutput(o);
+                  }
+                }
+              ).catch(() => {});
             }
             const result = await waitForTagResults(
               job.pluginId,
@@ -383,6 +508,12 @@
               job.requestId,
               () => cancelled
             );
+            const finalReasoning = (result?.reasoning || reasoning);
+            const finalOutput = (result?.output || output);
+            if (!cancelled) {
+              setReasoning(finalReasoning);
+              setOutput(finalOutput);
+            }
             if (result?.error) {
               throw new Error(result.error);
             }
@@ -397,7 +528,7 @@
               const match = await findTagMatch(graphqlURL, name);
               const aliasMatch = !match.exact && match.alias;
               if (aliasMatch) {
-                console.debug('[LLMImageTag] Alias match resolved:', {
+                console.error('[LLMImageTag] Alias match resolved:', {
                   name,
                   aliasOwner: match.alias.name,
                   aliasOwnerId: match.alias.id,
@@ -431,6 +562,16 @@
         };
       }, [graphqlURL]);
 
+      useEffect(() => {
+        const el = streamBoxRef.current;
+        if (!el || !autoScrollRef.current) return;
+        requestAnimationFrame(() => {
+          const recheck = streamBoxRef.current;
+          if (!recheck) return;
+          recheck.scrollTop = recheck.scrollHeight;
+        });
+      }, [reasoning, output]);
+
       function toggleSelected(uid) {
         setSelected((prev) => {
           if (prev.includes(uid)) {
@@ -450,25 +591,25 @@
         try {
           const currentTagIds = await findImageTagIds(graphqlURL, imageId);
           const tagIds = currentTagIds.slice();
-          console.debug('[LLMImageTag] Current image tags:', currentTagIds);
-          console.debug('[LLMImageTag] Selected tags:', selected);
+          console.error('[LLMImageTag] Current image tags:', currentTagIds);
+          console.error('[LLMImageTag] Selected tags:', selected);
           for (const suggestion of suggestions) {
             if (!selected.includes(suggestion.uid)) continue;
             let tagId = suggestion.existingId;
             if (!tagId) {
-              console.debug('[LLMImageTag] Creating tag:', suggestion.name);
+              console.error('[LLMImageTag] Creating tag:', suggestion.name);
               const created = await createTagSafe(graphqlURL, suggestion.name, {
                 id: suggestion.aliasOwnerId,
                 name: suggestion.aliasOwnerName,
               });
               tagId = created.id;
-              console.debug('[LLMImageTag] Created tag:', {
+              console.error('[LLMImageTag] Created tag:', {
                 name: suggestion.name,
                 id: tagId,
                 created: created.created,
               });
             }
-            console.debug('[LLMImageTag] Using tag:', {
+            console.error('[LLMImageTag] Using tag:', {
               name: suggestion.name,
               id: tagId,
             });
@@ -477,10 +618,10 @@
             }
           }
           const deduped = Array.from(new Set(tagIds));
-          console.debug('[LLMImageTag] Final tag id list:', deduped);
+          console.error('[LLMImageTag] Final tag id list:', deduped);
           await updateImageTags(graphqlURL, imageId, deduped);
           const after = await findImageTagIds(graphqlURL, imageId);
-          console.debug('[LLMImageTag] Tags after update:', after);
+          console.error('[LLMImageTag] Tags after update:', after);
           Toast?.success?.('Tags applied');
           onClose();
         } catch (e) {
@@ -493,10 +634,23 @@
 
       const empty = !loading && !suggestions.length;
 
+      async function handleClose() {
+        if (jobIdRef.current) {
+          try {
+            await graphqlRequest(graphqlURL, `
+              mutation StopJob($job_id: ID!) { stopJob(job_id: $job_id) }
+            `, { job_id: jobIdRef.current });
+          } catch (e) {
+            // ignore stop errors — job may already be finished
+          }
+        }
+        onClose();
+      }
+
       return (
         React.createElement(
           Modal,
-          { show: true, onHide: onClose, size: 'lg' },
+          { show: true, onHide: handleClose, backdrop: false, keyboard: false, className: 'llm-tag-modal-wrapper', dialogClassName: 'llm-tag-modal-dialog' },
           React.createElement(
             Modal.Header,
             { closeButton: true },
@@ -508,13 +662,79 @@
             loading
               ? React.createElement(
                   'div',
-                  { className: 'd-flex align-items-center' },
-                  React.createElement(Spinner, {
-                    animation: 'border',
-                    role: 'status',
-                    className: 'mr-3',
-                  }),
-                  React.createElement('span', null, 'Running LLM task...')
+                  null,
+                  React.createElement(
+                    'div',
+                    { className: 'd-flex align-items-center mb-3' },
+                    React.createElement(Spinner, {
+                      animation: 'border',
+                      role: 'status',
+                      className: 'mr-3',
+                    }),
+                    React.createElement(
+                      'span',
+                      null,
+                      'Running LLM task...'
+                    )
+                  ),
+                  (reasoning || output)
+                    ? React.createElement(
+                        'div',
+                        {
+                          ref: streamBoxRef,
+                          onScroll: handleStreamScroll,
+                          className: 'border rounded p-2 mb-3',
+                          style: {
+                            maxHeight: '300px',
+                            overflowY: 'auto',
+                            background: '#1a1a2e',
+                            fontFamily:
+                              'monospace',
+                            fontSize: '0.85rem',
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-word',
+                            color: '#c0c0c0',
+                          },
+                        },
+                        reasoning
+                          ? React.createElement(
+                              'div',
+                              { style: { color: '#8888cc' } },
+                              React.createElement(
+                                'strong',
+                                null,
+                                'Thinking...'
+                              ),
+                              React.createElement('br'),
+                              reasoning
+                            )
+                          : null,
+                        output
+                          ? React.createElement(
+                              'div',
+                              {
+                                style: {
+                                  marginTop: reasoning ? '0.5rem' : '0',
+                                  borderTop: reasoning
+                                    ? '1px solid #444'
+                                    : 'none',
+                                  paddingTop: reasoning ? '0.5rem' : '0',
+                                  color: '#a0d0a0',
+                                },
+                              },
+                              reasoning
+                                ? React.createElement(
+                                    'strong',
+                                    null,
+                                    'Output:'
+                                  )
+                                : null,
+                              reasoning ? React.createElement('br') : null,
+                              output
+                            )
+                          : null
+                      )
+                    : null
                 )
               : null,
             error
@@ -590,6 +810,80 @@
                     )
                   )
                 )
+              : null,
+            !loading && (reasoning || output)
+              ? React.createElement(
+                  'div',
+                  { className: 'mt-3' },
+                  React.createElement(
+                    Button,
+                    {
+                      variant: 'link',
+                      size: 'sm',
+                      className: 'p-0',
+                      onClick: () => setShowReasoning(!showReasoning),
+                      style: { textDecoration: 'none' },
+                    },
+                    showReasoning
+                      ? 'Hide thinking/output'
+                      : 'Show thinking/output'
+                  ),
+                  showReasoning
+                    ? React.createElement(
+                        'div',
+                        {
+                          className: 'border rounded p-2 mt-1',
+                          style: {
+                            maxHeight: '300px',
+                            overflowY: 'auto',
+                            background: '#1a1a2e',
+                            fontFamily: 'monospace',
+                            fontSize: '0.85rem',
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-word',
+                            color: '#c0c0c0',
+                          },
+                        },
+                        reasoning
+                          ? React.createElement(
+                              'div',
+                              { style: { color: '#8888cc' } },
+                              React.createElement(
+                                'strong',
+                                null,
+                                'Thinking:'
+                              ),
+                              React.createElement('br'),
+                              reasoning
+                            )
+                          : null,
+                        output
+                          ? React.createElement(
+                              'div',
+                              {
+                                style: {
+                                  marginTop: reasoning ? '0.5rem' : '0',
+                                  borderTop: reasoning
+                                    ? '1px solid #444'
+                                    : 'none',
+                                  paddingTop: reasoning ? '0.5rem' : '0',
+                                  color: '#a0d0a0',
+                                },
+                              },
+                              reasoning
+                                ? React.createElement(
+                                    'strong',
+                                    null,
+                                    'Output:'
+                                  )
+                                : null,
+                              reasoning ? React.createElement('br') : null,
+                              output
+                            )
+                          : null
+                      )
+                    : null
+                )
               : null
           ),
           React.createElement(
@@ -597,7 +891,7 @@
             null,
             React.createElement(
               Button,
-              { variant: 'secondary', onClick: onClose, disabled: applying },
+              { variant: 'secondary', onClick: handleClose, disabled: applying },
               'Cancel'
             ),
             React.createElement(
@@ -653,7 +947,7 @@
     item.textContent = 'Tag image (LLM)';
     item.addEventListener('click', function (ev) {
       ev.preventDefault();
-      console.debug('[LLMImageTag] Menu item clicked');
+      console.error('[LLMImageTag] Menu item clicked');
       const imageId = getImageIdFromURL();
       if (!imageId) {
         alert('LLM Image Tag: could not determine image id from URL.');
@@ -720,7 +1014,7 @@
         }
       },
     });
-    console.debug('[LLMImageTag] Task registered via registerTask');
+    console.error('[LLMImageTag] Task registered via registerTask');
   } else {
     mountIfPossible();
     const observer = new MutationObserver((mutationsList) => {
@@ -741,5 +1035,5 @@
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
-  console.debug('[LLMImageTag] UI script initialized');
+  console.error('[LLMImageTag] UI script initialized');
 })();
